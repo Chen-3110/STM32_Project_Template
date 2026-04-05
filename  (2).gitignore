@@ -1,0 +1,30 @@
+# 编译输出文件夹
+Debug/
+Release/
+Build/
+
+# 编译中间文件
+*.o
+*.d
+*.crf
+*.htm
+*.dep
+*.lnp
+*.sct
+*.map
+*.lst
+*.axf
+*.elf
+*.bin
+*.hex
+
+# IDE 自动生成的私有配置
+.mxproject
+.settings/
+.vscode/ipch/
+.vscode/bin/
+.vscode/obj/
+
+# 操作系统临时文件
+Thumbs.db
+.DS_Store
