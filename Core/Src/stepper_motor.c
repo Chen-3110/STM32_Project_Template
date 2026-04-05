@@ -7,6 +7,10 @@
 Plotter_Job_t g_plotter_job = {0};
 static Plotter_Hardware_t hw_config;
 
+// Z轴运动状态（已在 stepper_motor.h 中定义）
+
+Z_Axis_State_t z_axis_state = {0};
+
 #ifndef PI
 #define PI 3.1415926535f
 #endif
@@ -135,11 +139,59 @@ void Plotter_Stop(void) {
 }
 
 /**
- * @brief Z轴控制（预留功能）
+ * @brief Z轴控制
+ * @param target_z 目标Z坐标（脉冲数，正值为上升，负值为下降）
+ * @param speed_hz 目标速度（Hz，范围400-12000）
  */
 void Plotter_SetZ(int32_t target_z, uint16_t speed_hz) {
-    // 预留Z轴控制功能
-    // 实现方式与X/Y轴类似
+    // 1. 检查Z轴是否正在运动
+    if (z_axis_state.is_busy) {
+        return;
+    }
+    
+    // 2. 输入参数验证
+    if (speed_hz < 400) speed_hz = 400;
+    if (speed_hz > 12000) speed_hz = 12000;
+    
+    // 3. 计算目标步数（绝对值）
+    z_axis_state.target_steps = abs(target_z);
+    if (z_axis_state.target_steps == 0) {
+        return; // 零位移，直接返回
+    }
+    
+    // 4. 方向控制：根据target_z的正负设置PB1 (Z_Dir)的电平
+    if (target_z >= 0) {
+        // 正方向
+        hw_config.z_dir.port->BSRR = hw_config.z_dir.pin;
+        z_axis_state.direction = 1;
+    } else {
+        // 负方向
+        hw_config.z_dir.port->BSRR = (uint32_t)hw_config.z_dir.pin << 16;
+        z_axis_state.direction = 0;
+    }
+    
+    // 5. 计算ARR值（基于1MHz基准频率）
+    // ARR计算公式：ARR = (1MHz基础频率 / 目标频率) - 1
+    uint16_t arr = (1000000 / speed_hz) - 1;
+    
+    // 限制ARR范围，确保频率在有效范围内
+    if (arr < 83) arr = 83;       // 上限12kHz：1MHz/12000 ≈ 83
+    if (arr > 2499) arr = 2499;   // 下限400Hz
+    
+    // 6. 配置TIM3
+    __HAL_TIM_SET_AUTORELOAD(&htim3, arr);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, arr / 2); // 50%占空比
+    
+    // 7. 初始化Z轴状态
+    z_axis_state.current_step = 0;
+    z_axis_state.is_busy = 1;
+    
+    // 8. 启动TIM3 PWM输出（TIM3_CH3对应PB0）
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+    
+    // 9. 开启TIM3更新中断用于步数计数
+    __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
+    __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 }
 
 /**
@@ -147,6 +199,23 @@ void Plotter_SetZ(int32_t target_z, uint16_t speed_hz) {
  * 包含Bresenham引脚翻转、脉宽延时以及current_arr的加减速更新逻辑
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    // 0. 硬限位紧急停机检测 (X:PE7, Y:PE8, Z:PE9) - 适用于所有定时器
+    if (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_7) == GPIO_PIN_RESET ||  // X轴限位
+        HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_8) == GPIO_PIN_RESET ||  // Y轴限位
+        HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_9) == GPIO_PIN_RESET)    // Z轴限位
+    {
+        Plotter_Stop();
+        g_plotter_job.is_busy = 0;
+        
+        // 同时停止Z轴运动
+        if (z_axis_state.is_busy) {
+            HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_3);
+            __HAL_TIM_DISABLE_IT(&htim3, TIM_IT_UPDATE);
+            z_axis_state.is_busy = 0;
+        }
+        return;
+    }
+    
     if (htim->Instance == TIM6) {
         // 1. 检查任务状态
         if (!g_plotter_job.is_busy) {
@@ -215,6 +284,25 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         if (g_plotter_job.current_step >= g_plotter_job.total_steps) {
             g_plotter_job.is_busy = 0;
             HAL_TIM_Base_Stop_IT(&htim6);
+        }
+    }
+    else if (htim->Instance == TIM3) {
+        // TIM3中断：Z轴步数计数
+        if (!z_axis_state.is_busy) {
+            // Z轴不忙，停止中断
+            __HAL_TIM_DISABLE_IT(&htim3, TIM_IT_UPDATE);
+            return;
+        }
+        
+        // 增加步数计数
+        z_axis_state.current_step++;
+        
+        // 检查是否到达目标步数
+        if (z_axis_state.current_step >= z_axis_state.target_steps) {
+            // 到达目标步数，停止PWM输出
+            HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_3);
+            __HAL_TIM_DISABLE_IT(&htim3, TIM_IT_UPDATE);
+            z_axis_state.is_busy = 0;
         }
     }
 }

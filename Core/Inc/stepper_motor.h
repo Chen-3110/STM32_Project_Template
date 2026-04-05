@@ -64,6 +64,16 @@ typedef struct {
 // 全局变量声明
 extern Plotter_Job_t g_plotter_job;
 
+// Z轴运动状态结构体
+typedef struct {
+    volatile uint8_t is_busy;      // Z轴运动忙标志
+    int32_t target_steps;          // 目标步数（绝对值）
+    int32_t current_step;          // 当前已走步数
+    uint8_t direction;             // 方向：1=正方向，0=负方向
+} Z_Axis_State_t;
+
+extern Z_Axis_State_t z_axis_state;
+
 // 新版写字机接口函数
 void Plotter_Init(Plotter_Hardware_t *hw_config);
 void Plotter_StartLine(int32_t target_x, int32_t target_y, uint16_t speed_hz);

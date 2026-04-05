@@ -59,6 +59,9 @@ Plotter_Hardware_t plotter_hw;
 // 外部定义的绘图任务
 extern Plotter_Job_t g_plotter_job;
 
+// 外部定义的Z轴状态
+extern Z_Axis_State_t z_axis_state;
+
 // 外部定义的DMA句柄
 extern DMA_HandleTypeDef hdma_usart1_rx;
 
@@ -214,13 +217,14 @@ int main(void)
     }
     
     // 检查运动任务是否完成，发送OK反馈
-    if (g_plotter_job.is_busy == 0)
+    // 仅当X/Y轴插补和Z轴运动全部真正结束后才发送OK\n
+    if (g_plotter_job.is_busy == 0 && z_axis_state.is_busy == 0)
     {
       static uint8_t last_busy_state = 1;
       if (last_busy_state == 1)
       {
         // 运动完成，发送OK\n
-        uint8_t ok_msg[] = "OK\n";
+        static uint8_t ok_msg[] = "OK\n";
         HAL_UART_Transmit_DMA(&huart1, ok_msg, sizeof(ok_msg)-1);
         last_busy_state = 0;
       }
