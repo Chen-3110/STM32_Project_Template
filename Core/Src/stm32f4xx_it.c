@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "main.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,7 +64,8 @@ extern DMA_HandleTypeDef hdma_usart2_tx;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
-
+extern volatile uint8_t uart_rx_flag;
+extern uint8_t rx_buffer[];
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -238,7 +240,26 @@ void DMA1_Stream6_IRQHandler(void)
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-
+  // 检测IDLE中断
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE) != RESET)
+  {
+    __HAL_UART_CLEAR_IDLEFLAG(&huart1);
+    
+    // 停止DMA以获取接收到的数据长度
+    HAL_UART_DMAStop(&huart1);
+    
+    // 计算接收到的数据长度
+    uint16_t rx_len = RX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
+    
+    if (rx_len > 0)
+    {
+      // 设置标志位，表示有数据需要处理
+      uart_rx_flag = 1;
+    }
+    
+    // 重新启动DMA接收
+    HAL_UART_Receive_DMA(&huart1, rx_buffer, RX_BUFFER_SIZE);
+  }
   /* USER CODE END USART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */

@@ -1,7 +1,7 @@
 #ifndef SOFT_TIMER_H
 #define SOFT_TIMER_H
 
-#include "stm32f1xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 /*============================================================
  *  DWT 初始化（使用微秒定时器前必须调用一次）

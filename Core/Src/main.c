@@ -25,7 +25,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "soft_timer.h"
+#include "stepper_motor.h"
+#include <stdlib.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,18 +49,78 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+// UART接收缓冲区
+uint8_t rx_buffer[RX_BUFFER_SIZE];
+volatile uint8_t uart_rx_flag = 0;
 
+// 绘图机硬件配置
+Plotter_Hardware_t plotter_hw;
+
+// 外部定义的绘图任务
+extern Plotter_Job_t g_plotter_job;
+
+// 外部定义的DMA句柄
+extern DMA_HandleTypeDef hdma_usart1_rx;
+
+// 运动完成状态跟踪
+static uint8_t last_busy_state = 1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+void ParseUARTCommand(uint8_t* buffer, uint16_t len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+/**
+  * @brief 解析UART命令，格式为"X100 Y200 Z10\n"
+  * @param buffer 接收缓冲区
+  * @param len 数据长度
+  */
+void ParseUARTCommand(uint8_t* buffer, uint16_t len)
+{
+    // 确保以换行符结尾且有足够空间添加终止符
+    if (len == 0 || buffer[len-1] != '\n' || len >= RX_BUFFER_SIZE)
+        return;
+    
+    // 将缓冲区转换为字符串（替换换行符为终止符）
+    buffer[len-1] = '\0';  // 去掉换行符
+    char* cmd = (char*)buffer;
+    
+    int32_t x = 0, y = 0, z = 0;
+    char* token = strtok(cmd, " ");
+    
+    while (token != NULL)
+    {
+        if (token[0] == 'X' || token[0] == 'x')
+        {
+            x = atoi(token + 1);
+        }
+        else if (token[0] == 'Y' || token[0] == 'y')
+        {
+            y = atoi(token + 1);
+        }
+        else if (token[0] == 'Z' || token[0] == 'z')
+        {
+            z = atoi(token + 1);
+        }
+        token = strtok(NULL, " ");
+    }
+    
+    // 如果有有效的坐标，启动运动
+    if (x != 0 || y != 0)
+    {
+        // 默认速度1000Hz
+        Plotter_StartLine(x, y, 1000);
+    }
+    
+    if (z != 0)
+    {
+        Plotter_SetZ(z, 1000);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -95,7 +158,37 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  // 初始化DWT微秒级延时
+  DWT_Init();
+  
+  // 配置绘图机硬件引脚映射（根据PROJECT_CONTEXT.md中的硬件映射）
+  plotter_hw.x_step.port = GPIOB;
+  plotter_hw.x_step.pin = GPIO_PIN_10;
+  plotter_hw.x_dir.port = GPIOB;
+  plotter_hw.x_dir.pin = GPIO_PIN_11;
+  
+  plotter_hw.y_step.port = GPIOB;
+  plotter_hw.y_step.pin = GPIO_PIN_12;
+  plotter_hw.y_dir.port = GPIOB;
+  plotter_hw.y_dir.pin = GPIO_PIN_13;
+  
+  plotter_hw.z_step.port = GPIOB;
+  plotter_hw.z_step.pin = GPIO_PIN_0;  // TIM3_CH3 (PB0) 用于Z轴脉冲
+  plotter_hw.z_dir.port = GPIOB;
+  plotter_hw.z_dir.pin = GPIO_PIN_1;
+  
+  // 初始化绘图机硬件
+  Plotter_Init(&plotter_hw);
+  
+  // 启动UART1 DMA接收（循环模式）并启用IDLE中断
+  HAL_UART_Receive_DMA(&huart1, rx_buffer, RX_BUFFER_SIZE);
+  __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+  
+  // 使能电机（PB2低电平有效）
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  
+  // 启动TIM6作为运动心脏（1MHz，12kHz IRQ）
+  HAL_TIM_Base_Start_IT(&htim6);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -105,6 +198,37 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    // 检查UART接收标志
+    if (uart_rx_flag)
+    {
+      uart_rx_flag = 0;
+      
+      // 计算接收到的数据长度
+      uint16_t rx_len = RX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
+      
+      if (rx_len > 0 && rx_len < RX_BUFFER_SIZE)
+      {
+        // 解析命令
+        ParseUARTCommand(rx_buffer, rx_len);
+      }
+    }
+    
+    // 检查运动任务是否完成，发送OK反馈
+    if (g_plotter_job.is_busy == 0)
+    {
+      static uint8_t last_busy_state = 1;
+      if (last_busy_state == 1)
+      {
+        // 运动完成，发送OK\n
+        uint8_t ok_msg[] = "OK\n";
+        HAL_UART_Transmit_DMA(&huart1, ok_msg, sizeof(ok_msg)-1);
+        last_busy_state = 0;
+      }
+    }
+    else
+    {
+      last_busy_state = 1;
+    }
   }
   /* USER CODE END 3 */
 }
