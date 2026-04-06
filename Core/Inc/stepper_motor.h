@@ -107,4 +107,7 @@ void Stepper_Run_Task(StepperMotor_t *motor);
 void Stepper_Reverse_Soft(StepperMotor_t *motor, uint32_t reverse_decel_time_ms);
 void Draw_Line_Angle(StepperMotor_t *motor_x, StepperMotor_t *motor_y, float angle_deg, float total_speed_hz, uint32_t accel_time_ms);
 
+// 获取当前位置（毫米）
+void Plotter_GetCurrentPosition(float *x_mm, float *y_mm, float *z_mm);
+
 #endif /* __STEPPER_MOTOR_H */

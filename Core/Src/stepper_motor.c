@@ -1,11 +1,25 @@
 #include "stepper_motor.h"
 #include "tim.h"
+#include "soft_timer.h"
 #include <stdlib.h>
 #include <math.h>
+
+// 外部UART句柄声明
+extern UART_HandleTypeDef huart1;
+
+// 步进每毫米转换系数（与main.c保持一致）
+#define STEPS_PER_MM_X  200.0f
+#define STEPS_PER_MM_Y  200.0f
+#define STEPS_PER_MM_Z  400.0f
 
 // 全局变量定义
 Plotter_Job_t g_plotter_job = {0};
 static Plotter_Hardware_t hw_config;
+
+// 当前位置（步数）
+static int32_t current_pos_steps_x = 0;
+static int32_t current_pos_steps_y = 0;
+static int32_t current_pos_steps_z = 0;
 
 // S型曲线默认配置
 static S_Curve_Config_t s_curve_config = {
@@ -115,31 +129,52 @@ void Plotter_StartLine(int32_t tx, int32_t ty, uint16_t speed_hz) {
     // 6. 计算S型曲线参数（7段曲线）
     // 使用配置参数计算总加速段步数
     uint32_t total_accel_steps = (uint32_t)(g_plotter_job.total_steps * s_curve_config.accel_ratio);
-    if (total_accel_steps < 10) total_accel_steps = g_plotter_job.total_steps / 2; // 短距离时增加加速段比例
     
-    // 分配各阶段步数（使用配置的比例）
-    // 阶段0: 加加速段
-    // 阶段1: 匀加速段
-    // 阶段2: 减加速段
-    // 阶段3: 匀速段
-    // 阶段4: 加减速段
-    // 阶段5: 匀减速段
-    // 阶段6: 减减速段
-    g_plotter_job.phase_steps[0] = total_accel_steps * s_curve_config.phase_ratios[0];
-    g_plotter_job.phase_steps[1] = total_accel_steps * s_curve_config.phase_ratios[1];
-    g_plotter_job.phase_steps[2] = total_accel_steps * s_curve_config.phase_ratios[2];
-    g_plotter_job.phase_steps[3] = g_plotter_job.total_steps - 2 * total_accel_steps; // 匀速段
-    g_plotter_job.phase_steps[4] = total_accel_steps * s_curve_config.phase_ratios[4];
-    g_plotter_job.phase_steps[5] = total_accel_steps * s_curve_config.phase_ratios[5];
-    g_plotter_job.phase_steps[6] = total_accel_steps * s_curve_config.phase_ratios[6];
+    // 安全检查：如果总加速步数小于10，回退到简单的T型加减速或匀速运动
+    uint8_t use_s_curve = 1;
+    if (total_accel_steps < 10) {
+        // 不执行S型曲线计算，使用匀速运动（直接以峰值频率运行）
+        use_s_curve = 0;
+        total_accel_steps = 0;
+    }
     
-    // 计算加加速度（jerk）参数，应用jerk_ratio系数，转换为Q16定点数
-    // jerk_q16 = (start_arr - peak_arr) * 65536 / (total_accel_steps * total_accel_steps) * jerk_ratio
-    if (total_accel_steps > 0) {
-        int32_t arr_diff = (int32_t)(g_plotter_job.start_arr - g_plotter_job.peak_arr);
-        int32_t denominator = total_accel_steps * total_accel_steps;
-        g_plotter_job.jerk_q16 = (arr_diff * 65536 / denominator) * s_curve_config.jerk_ratio;
+    if (use_s_curve) {
+        // 分配各阶段步数（使用配置的比例）
+        // 阶段0: 加加速段
+        // 阶段1: 匀加速段
+        // 阶段2: 减加速段
+        // 阶段3: 匀速段
+        // 阶段4: 加减速段
+        // 阶段5: 匀减速段
+        // 阶段6: 减减速段
+        g_plotter_job.phase_steps[0] = total_accel_steps * s_curve_config.phase_ratios[0];
+        g_plotter_job.phase_steps[1] = total_accel_steps * s_curve_config.phase_ratios[1];
+        g_plotter_job.phase_steps[2] = total_accel_steps * s_curve_config.phase_ratios[2];
+        g_plotter_job.phase_steps[3] = g_plotter_job.total_steps - 2 * total_accel_steps; // 匀速段
+        g_plotter_job.phase_steps[4] = total_accel_steps * s_curve_config.phase_ratios[4];
+        g_plotter_job.phase_steps[5] = total_accel_steps * s_curve_config.phase_ratios[5];
+        g_plotter_job.phase_steps[6] = total_accel_steps * s_curve_config.phase_ratios[6];
+        
+        // 计算加加速度（jerk）参数，应用jerk_ratio系数，转换为Q16定点数
+        // jerk_q16 = (start_arr - peak_arr) * 65536 / (total_accel_steps * total_accel_steps) * jerk_ratio
+        // 使用int64_t中间计算防止32位溢出
+        if (total_accel_steps > 0) {
+            int32_t arr_diff = (int32_t)(g_plotter_job.start_arr - g_plotter_job.peak_arr);
+            int64_t denominator = (int64_t)total_accel_steps * total_accel_steps;
+            // 使用int64_t进行乘法，防止溢出
+            int64_t numerator = (int64_t)arr_diff * 65536;
+            int64_t jerk_value = numerator / denominator;
+            // 应用jerk_ratio系数并转换为int32_t
+            g_plotter_job.jerk_q16 = (int32_t)(jerk_value * s_curve_config.jerk_ratio);
+        } else {
+            g_plotter_job.jerk_q16 = 0;
+        }
     } else {
+        // 不使用S型曲线，设置所有阶段为匀速（峰值频率）
+        for (int i = 0; i < 7; i++) {
+            g_plotter_job.phase_steps[i] = 0;
+        }
+        g_plotter_job.phase_steps[3] = g_plotter_job.total_steps; // 整个运动都是匀速段
         g_plotter_job.jerk_q16 = 0;
     }
     
@@ -248,6 +283,18 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
             __HAL_TIM_DISABLE_IT(&htim3, TIM_IT_UPDATE);
             z_axis_state.is_busy = 0;
         }
+        
+        // 发送具体的限位错误信息
+        if (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_7) == GPIO_PIN_RESET) {
+            static const uint8_t error_msg[] = "Error: X-Limit Triggered\n";
+            HAL_UART_Transmit(&huart1, error_msg, sizeof(error_msg)-1, 10);
+        } else if (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_8) == GPIO_PIN_RESET) {
+            static const uint8_t error_msg[] = "Error: Y-Limit Triggered\n";
+            HAL_UART_Transmit(&huart1, error_msg, sizeof(error_msg)-1, 10);
+        } else if (HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_9) == GPIO_PIN_RESET) {
+            static const uint8_t error_msg[] = "Error: Z-Limit Triggered\n";
+            HAL_UART_Transmit(&huart1, error_msg, sizeof(error_msg)-1, 10);
+        }
         return;
     }
     
@@ -259,38 +306,55 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         }
 
         // 2. Bresenham算法步进 - 使用BSRR寄存器直接操作引脚
+        uint8_t need_x_step = 0;
+        uint8_t need_y_step = 0;
+
         if (g_plotter_job.dx >= g_plotter_job.dy) {
             // 主轴为X轴
-            hw_config.x_step.port->BSRR = hw_config.x_step.pin; // X轴脉冲上升沿
+            need_x_step = 1;
             g_plotter_job.err += g_plotter_job.dy;
             
             if (g_plotter_job.err >= g_plotter_job.dx) {
                 g_plotter_job.err -= g_plotter_job.dx;
-                hw_config.y_step.port->BSRR = hw_config.y_step.pin; // Y轴脉冲上升沿
+                need_y_step = 1;
             }
         } else {
             // 主轴为Y轴
-            hw_config.y_step.port->BSRR = hw_config.y_step.pin; // Y轴脉冲上升沿
+            need_y_step = 1;
             g_plotter_job.err += g_plotter_job.dx;
             
             if (g_plotter_job.err >= g_plotter_job.dy) {
                 g_plotter_job.err -= g_plotter_job.dy;
-                hw_config.x_step.port->BSRR = hw_config.x_step.pin; // X轴脉冲上升沿
+                need_x_step = 1;
             }
         }
-        
-        // 3. 脉冲宽度延时（确保步进电机能识别脉冲）
-        // 72个NOP在72MHz下约1μs，满足步进电机最小脉冲宽度要求
-        for (volatile int i = 0; i < 72; i++) {
-            __NOP();
+
+        // 拉高需要步进的引脚
+        if (need_x_step) {
+            hw_config.x_step.port->BSRR = hw_config.x_step.pin;
         }
-        
+        if (need_y_step) {
+            hw_config.y_step.port->BSRR = hw_config.y_step.pin;
+        }
+
+        // 3. 脉冲宽度延时（确保步进电机能识别脉冲）
+        // 使用DWT微秒延时，稳定2微秒，确保驱动器（如TB6600）能可靠识别
+        Delay_us(2);
+
         // 4. 拉低所有STEP引脚（脉冲下降沿）
         hw_config.x_step.port->BSRR = (uint32_t)hw_config.x_step.pin << 16;
         hw_config.y_step.port->BSRR = (uint32_t)hw_config.y_step.pin << 16;
         
         // 5. 更新步数计数器
         g_plotter_job.current_step++;
+        
+        // 更新当前位置（步数）
+        if (need_x_step) {
+            current_pos_steps_x += g_plotter_job.dir_x;
+        }
+        if (need_y_step) {
+            current_pos_steps_y += g_plotter_job.dir_y;
+        }
         
         // 6. S型加减速控制（7段曲线）- 优化版本
         // 使用预计算的阶段边界快速确定当前阶段
@@ -413,6 +477,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         
         // 增加步数计数
         z_axis_state.current_step++;
+        
+        // 更新Z轴当前位置（步数）
+        if (z_axis_state.direction == 1) {
+            current_pos_steps_z++;
+        } else {
+            current_pos_steps_z--;
+        }
         
         // 检查是否到达目标步数
         if (z_axis_state.current_step >= z_axis_state.target_steps) {
@@ -665,4 +736,16 @@ void Plotter_GetDefaultScurveConfig(S_Curve_Config_t *config) {
     config->phase_ratios[4] = 0.5f;  // 加减速段
     config->phase_ratios[5] = 0.3f;  // 匀减速段
     config->phase_ratios[6] = 0.2f;  // 减减速段
+}
+
+/**
+ * @brief 获取当前位置（毫米）
+ * @param x_mm X轴位置（毫米）输出指针
+ * @param y_mm Y轴位置（毫米）输出指针
+ * @param z_mm Z轴位置（毫米）输出指针
+ */
+void Plotter_GetCurrentPosition(float *x_mm, float *y_mm, float *z_mm) {
+    if (x_mm) *x_mm = (float)current_pos_steps_x / STEPS_PER_MM_X;
+    if (y_mm) *y_mm = (float)current_pos_steps_y / STEPS_PER_MM_Y;
+    if (z_mm) *z_mm = (float)current_pos_steps_z / STEPS_PER_MM_Z;
 }
