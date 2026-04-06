@@ -51,386 +51,140 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-// UART接收缓冲区
 uint8_t rx_buffer[RX_BUFFER_SIZE];
 volatile uint8_t uart_rx_flag = 0;
+static uint32_t last_rx_pos = 0; // DMA 循环缓冲区读指针
 
-// 绘图机硬件配置
 Plotter_Hardware_t plotter_hw;
-
-// 外部定义的绘图任务
 extern Plotter_Job_t g_plotter_job;
-
-// 外部定义的Z轴状态
 extern Z_Axis_State_t z_axis_state;
-
-// 外部定义的DMA句柄
 extern DMA_HandleTypeDef hdma_usart1_rx;
 
-// 运动完成状态跟踪
-static uint8_t last_busy_state = 1;
-
-// UART接收位置跟踪
-static uint32_t last_rx_pos = 0;
-
-// 当前坐标（毫米）
-static float cur_x_mm = 0.0f, cur_y_mm = 0.0f, cur_z_mm = 0.0f;
-
-#define STEPS_PER_MM_X  200.0f  // 根据你的实际硬件修改
-#define STEPS_PER_MM_Y  200.0f
-#define STEPS_PER_MM_Z  400.0f
-
-#define PLOTTER_DEFAULT_SPEED_HZ  5000  // 默认绘图速度 (单位: Hz, 范围 400-12000)
+#define PLOTTER_DEFAULT_SPEED_HZ  5000 
 
 #ifndef PI
 #define PI 3.1415926535f
 #endif
 
-// 环形指令队列定义
+// 环形指令队列
 #define COMMAND_QUEUE_SIZE 10
-
 typedef struct {
-    float target_x_mm;  // X轴目标位置（毫米）
-    float target_y_mm;  // Y轴目标位置（毫米）
-    float target_z_mm;  // Z轴目标位置（毫米）
-    float speed_hz;     // 运动速度（Hz）
-    uint8_t has_xy;     // 是否有XY运动
-    uint8_t has_z;      // 是否有Z运动
+    float target_x_mm;  
+    float target_y_mm;  
+    float target_z_mm;  
+    float speed_hz;     
+    uint8_t has_xy;     
+    uint8_t has_z;      
 } Command_t;
 
 typedef struct {
     Command_t commands[COMMAND_QUEUE_SIZE];
-    uint8_t head;       // 队首索引（下一个要读取的位置）
-    uint8_t tail;       // 队尾索引（下一个要写入的位置）
-    uint8_t count;      // 队列中元素数量
+    uint8_t head;       
+    uint8_t tail;       
+    uint8_t count;      
 } CommandQueue_t;
 
 static CommandQueue_t command_queue = {0};
 
-// 预加载指令状态
-static Command_t pending_command;            // 预加载的下一条指令
-static uint8_t pending_command_valid = 0;    // 预加载指令是否有效
-
-// 速度过渡状态
-static uint8_t speed_transition_enabled = 0; // 是否启用速度过渡
-static float transition_speed_ratio = 0.3f;  // 过渡速度比例（30%）
-static float current_speed_hz = 0;           // 当前运动速度（Hz）
+// 解析层：用于跟踪上位机发送的“逻辑绝对坐标”
+static float last_queued_x = 0, last_queued_y = 0, last_queued_z = 0;
+// 执行层：用于跟踪下位机正在执行的“起始坐标”
+static float executed_x = 0, executed_y = 0, executed_z = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void ParseUARTCommand(uint8_t* buffer, uint16_t len);
+void ParseUARTCommand(char* cmd);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/**
-  * @brief 队列管理函数：初始化队列
-  */
-static void CommandQueue_Init(void)
-{
-    command_queue.head = 0;
-    command_queue.tail = 0;
-    command_queue.count = 0;
-}
-
-/**
-  * @brief 队列管理函数：检查队列是否已满
-  * @return 1表示队列已满，0表示未满
-  */
-static uint8_t CommandQueue_IsFull(void)
-{
-    return (command_queue.count == COMMAND_QUEUE_SIZE);
-}
-
-/**
-  * @brief 队列管理函数：检查队列是否为空
-  * @return 1表示队列为空，0表示非空
-  */
-static uint8_t CommandQueue_IsEmpty(void)
-{
-    return (command_queue.count == 0);
-}
-
-/**
-  * @brief 队列管理函数：入队
-  * @param cmd 要入队的指令
-  * @return 1表示成功，0表示队列已满
-  */
-static uint8_t CommandQueue_Enqueue(Command_t *cmd)
-{
-    if (CommandQueue_IsFull())
-        return 0;
-    
+// 队列基础函数
+static void CommandQueue_Init(void) { command_queue.head = 0; command_queue.tail = 0; command_queue.count = 0; }
+static uint8_t CommandQueue_IsFull(void) { return (command_queue.count == COMMAND_QUEUE_SIZE); }
+static uint8_t CommandQueue_IsEmpty(void) { return (command_queue.count == 0); }
+static uint8_t CommandQueue_Enqueue(Command_t *cmd) {
+    if (CommandQueue_IsFull()) return 0;
     command_queue.commands[command_queue.tail] = *cmd;
     command_queue.tail = (command_queue.tail + 1) % COMMAND_QUEUE_SIZE;
     command_queue.count++;
     return 1;
 }
-
-/**
-  * @brief 队列管理函数：出队
-  * @param cmd 出队的指令存储位置
-  * @return 1表示成功，0表示队列为空
-  */
-static uint8_t CommandQueue_Dequeue(Command_t *cmd)
-{
-    if (CommandQueue_IsEmpty())
-        return 0;
-    
+static uint8_t CommandQueue_Dequeue(Command_t *cmd) {
+    if (CommandQueue_IsEmpty()) return 0;
     *cmd = command_queue.commands[command_queue.head];
     command_queue.head = (command_queue.head + 1) % COMMAND_QUEUE_SIZE;
     command_queue.count--;
     return 1;
 }
 
-/**
-  * @brief 队列管理函数：查看队首元素（不出队）
-  * @param cmd 队首指令存储位置
-  * @return 1表示成功，0表示队列为空
-  */
-static uint8_t CommandQueue_Peek(Command_t *cmd)
-{
-    if (CommandQueue_IsEmpty())
-        return 0;
-    
-    *cmd = command_queue.commands[command_queue.head];
-    return 1;
+// 安全发送函数：防止 DMA 碰撞死锁
+static void Send_UART_Msg(const char* msg) {
+    while (huart1.gState != HAL_UART_STATE_READY); // 等待上一个传输完成
+    HAL_UART_Transmit_DMA(&huart1, (uint8_t*)msg, strlen(msg));
 }
 
-/**
-  * @brief 执行队列中的下一条指令
-  * @return 1表示成功执行了指令，0表示队列为空或运动忙
-  */
-static uint8_t ExecuteNextCommand(void)
-{
-    // 如果当前有运动正在进行，不能执行新指令
-    if (g_plotter_job.is_busy || z_axis_state.is_busy)
-        return 0;
+// 执行队列中的指令
+static void ExecuteNextCommand(void) {
+    if (g_plotter_job.is_busy || z_axis_state.is_busy) return;
     
     Command_t cmd;
-    if (!CommandQueue_Dequeue(&cmd))
-        return 0; // 队列为空
+    if (!CommandQueue_Dequeue(&cmd)) return;
     
-    // 执行XY运动（使用相对位移）
-    if (cmd.has_xy)
-    {
-        // 计算相对位移
-        float delta_x_mm = cmd.target_x_mm - cur_x_mm;
-        float delta_y_mm = cmd.target_y_mm - cur_y_mm;
-        
-        int32_t pulse_x = (int32_t)(delta_x_mm * STEPS_PER_MM_X);
-        int32_t pulse_y = (int32_t)(delta_y_mm * STEPS_PER_MM_Y);
+    // 计算相对位移（脉冲数）
+    if (cmd.has_xy) {
+        int32_t pulse_x = (int32_t)((cmd.target_x_mm - executed_x) * STEPS_PER_MM_X);
+        int32_t pulse_y = (int32_t)((cmd.target_y_mm - executed_y) * STEPS_PER_MM_Y);
         Plotter_StartLine(pulse_x, pulse_y, (uint16_t)cmd.speed_hz);
-        
-        // 更新当前坐标
-        cur_x_mm = cmd.target_x_mm;
-        cur_y_mm = cmd.target_y_mm;
+        executed_x = cmd.target_x_mm;
+        executed_y = cmd.target_y_mm;
     }
-    
-    // 执行Z轴运动（使用相对位移）
-    if (cmd.has_z)
-    {
-        // 计算相对位移
-        float delta_z_mm = cmd.target_z_mm - cur_z_mm;
-        int32_t pulse_z = (int32_t)(delta_z_mm * STEPS_PER_MM_Z);
+    if (cmd.has_z) {
+        int32_t pulse_z = (int32_t)((cmd.target_z_mm - executed_z) * STEPS_PER_MM_Z);
         Plotter_SetZ(pulse_z, (uint16_t)cmd.speed_hz);
-        
-        // 更新当前坐标
-        cur_z_mm = cmd.target_z_mm;
-    }
-    
-    return 1;
-}
-
-/**
-  * @brief 将ARR值转换为速度（Hz）
-  * @param arr 定时器ARR值
-  * @return 速度（Hz）
-  */
-static float ARR_To_SpeedHz(uint16_t arr)
-{
-    if (arr == 0) return 0;
-    return 1000000.0f / (arr + 1);
-}
-
-
-
-/**
-  * @brief 计算两个向量之间的夹角（度）
-  * @param dx1 向量1的X分量
-  * @param dy1 向量1的Y分量
-  * @param dx2 向量2的X分量
-  * @param dy2 向量2的Y分量
-  * @return 夹角（度，0-180）
-  */
-static float CalculateAngleBetweenVectors(float dx1, float dy1, float dx2, float dy2)
-{
-    // 计算向量点积
-    float dot = dx1 * dx2 + dy1 * dy2;
-    // 计算向量模长
-    float mag1 = sqrtf(dx1 * dx1 + dy1 * dy1);
-    float mag2 = sqrtf(dx2 * dx2 + dy2 * dy2);
-    
-    // 防止除零
-    if (mag1 < 1e-6f || mag2 < 1e-6f)
-        return 0.0f;
-    
-    // 计算余弦值并限制在[-1,1]范围内
-    float cos_theta = dot / (mag1 * mag2);
-    if (cos_theta > 1.0f) cos_theta = 1.0f;
-    if (cos_theta < -1.0f) cos_theta = -1.0f;
-    
-    // 计算夹角（弧度）并转换为度
-    float angle_rad = acosf(cos_theta);
-    float angle_deg = angle_rad * 180.0f / PI;
-    
-    return angle_deg;
-}
-
-/**
-  * @brief 检查当前运动是否即将结束，并预加载下一条指令
-  */
-static void CheckAndPreloadNextCommand(void)
-{
-    // 如果当前没有XY运动，则不需要预加载
-    if (!g_plotter_job.is_busy)
-        return;
-    
-    // 计算剩余步数
-    int32_t remaining_steps = g_plotter_job.total_steps - g_plotter_job.current_step;
-    
-    // 如果剩余步数小于等于提前加载阈值（例如总步数的10%或固定步数）
-    // 这里使用固定阈值20步，可以根据需要调整
-    if (remaining_steps <= 20)
-    {
-        // 如果还没有预加载下一条指令，则尝试预加载
-        if (!pending_command_valid && !CommandQueue_IsEmpty())
-        {
-            CommandQueue_Peek(&pending_command);
-            pending_command_valid = 1;
-            
-            // 计算当前运动方向向量
-            // 注意：g_plotter_job.dir_x和dir_y是方向符号（1或-1），但我们需要实际位移向量
-            // 使用dx和dy的符号与方向符号一致
-            float current_dx = g_plotter_job.dx * g_plotter_job.dir_x;
-            float current_dy = g_plotter_job.dy * g_plotter_job.dir_y;
-            
-            // 计算下一段运动方向向量
-            float next_dx = pending_command.target_x_mm;
-            float next_dy = pending_command.target_y_mm;
-            
-            // 计算夹角
-            float angle = CalculateAngleBetweenVectors(current_dx, current_dy, next_dx, next_dy);
-            
-            // 如果夹角小于10度（直线或微小转角），不启用速度过渡
-            if (angle < 10.0f)
-            {
-                speed_transition_enabled = 0;
-            }
-            else
-            {
-                speed_transition_enabled = 1;
-                
-                // 计算当前速度
-                current_speed_hz = ARR_To_SpeedHz(g_plotter_job.current_arr);
-                
-                // 计算过渡速度（当前速度的30%）
-                float transition_speed = current_speed_hz * transition_speed_ratio;
-                
-                // 限制过渡速度在有效范围内
-                if (transition_speed < 400) transition_speed = 400;
-                if (transition_speed > 12000) transition_speed = 12000;
-                
-                // 修改预加载指令的速度为过渡速度
-                // 注意：这里修改的是pending_command的副本，实际执行时会使用这个速度
-                pending_command.speed_hz = transition_speed;
-            }
-        }
+        executed_z = cmd.target_z_mm;
     }
 }
 
-/**
-  * @brief 解析UART命令，格式为"X100 Y200 Z10\n"
-  * @param buffer 接收缓冲区
-  * @param len 数据长度
-  */
-void ParseUARTCommand(uint8_t* buffer, uint16_t len)
-{
-    if (len == 0 || buffer[len-1] != '\n' || len >= RX_BUFFER_SIZE)
-        return;
-    
-    buffer[len-1] = '\0';
-    char* cmd = (char*)buffer;
-    
-    // 改用 float 接收上位机传来的物理位移（如 X10.5）
-    float target_x_mm = 0, target_y_mm = 0, target_z_mm = 0;
+// 解析指令
+void ParseUARTCommand(char* cmd) {
+    float target_x_mm = last_queued_x; 
+    float target_y_mm = last_queued_y; 
+    float target_z_mm = last_queued_z;
     uint8_t has_xy = 0, has_z = 0;
-    float speed_hz = PLOTTER_DEFAULT_SPEED_HZ; // 默认速度
+    float speed_hz = PLOTTER_DEFAULT_SPEED_HZ; 
+
+    // 处理实时位置查询指令
+    if (strstr(cmd, "M114") != NULL) {
+        float rx, ry, rz;
+        Plotter_GetCurrentPosition(&rx, &ry, &rz);
+        static char response[64];
+        snprintf(response, sizeof(response), "X%.2f Y%.2f Z%.2f\n", rx, ry, rz);
+        Send_UART_Msg(response);
+        return;
+    }
 
     char* token = strtok(cmd, " ");
-    uint8_t is_m114 = 0;
-    while (token != NULL)
-    {
-        // 检查是否为M114命令
-        if (strcmp(token, "M114") == 0) {
-            is_m114 = 1;
-        }
-        // 改用 atof 解析浮点数
-        else if (token[0] == 'X' || token[0] == 'x') {
-            target_x_mm = atof(token + 1);
-            has_xy = 1;
-        }
-        else if (token[0] == 'Y' || token[0] == 'y') {
-            target_y_mm = atof(token + 1);
-            has_xy = 1;
-        }
-        else if (token[0] == 'Z' || token[0] == 'z') {
-            target_z_mm = atof(token + 1);
-            has_z = 1;
-        }
-        else if (token[0] == 'F' || token[0] == 'f') {
-            // 解析速度参数
-            speed_hz = atof(token + 1);
-            // 速度范围限制
-            if (speed_hz < 400) speed_hz = 400;
-            if (speed_hz > 12000) speed_hz = 12000;
-        }
+    while (token != NULL) {
+        if (token[0] == 'X' || token[0] == 'x') { target_x_mm = atof(token + 1); has_xy = 1; }
+        else if (token[0] == 'Y' || token[0] == 'y') { target_y_mm = atof(token + 1); has_xy = 1; }
+        else if (token[0] == 'Z' || token[0] == 'z') { target_z_mm = atof(token + 1); has_z = 1; }
+        else if (token[0] == 'F' || token[0] == 'f') { speed_hz = atof(token + 1); }
         token = strtok(NULL, " ");
     }
     
-    // 如果是M114命令，立即回传当前位置
-    if (is_m114) {
-        float x_mm, y_mm, z_mm;
-        Plotter_GetCurrentPosition(&x_mm, &y_mm, &z_mm);
-        char response[64];
-        snprintf(response, sizeof(response), "X%.2f Y%.2f Z%.2f\n", x_mm, y_mm, z_mm);
-        HAL_UART_Transmit_DMA(&huart1, (uint8_t*)response, strlen(response));
-        return;
-    }
-    
-    // 构建指令结构体
-    Command_t command = {
-        .target_x_mm = target_x_mm,
-        .target_y_mm = target_y_mm,
-        .target_z_mm = target_z_mm,
-        .speed_hz = speed_hz,
-        .has_xy = has_xy,
-        .has_z = has_z
-    };
-    
-    // 入队
-    if (!CommandQueue_Enqueue(&command))
-    {
-        // 队列已满，可以发送错误反馈或丢弃指令
-        // 暂时简单丢弃
-    }
-    
-    // 如果当前没有运动，立即执行队列中的指令
-    if (!g_plotter_job.is_busy && !z_axis_state.is_busy)
-    {
-        ExecuteNextCommand();
+    // 如果包含有效位移，构建并压入队列
+    if (has_xy || has_z) {
+        Command_t command = {target_x_mm, target_y_mm, target_z_mm, speed_hz, has_xy, has_z};
+        if (CommandQueue_Enqueue(&command)) {
+            // 解析并排队成功，更新逻辑坐标，并立即回复OK
+            if(has_xy){ last_queued_x = target_x_mm; last_queued_y = target_y_mm; }
+            if(has_z) { last_queued_z = target_z_mm; }
+            Send_UART_Msg("OK\n"); 
+        } else {
+            Send_UART_Msg("Error: Queue Full\n");
+        }
     }
 }
 /* USER CODE END 0 */
@@ -513,112 +267,45 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // 检查UART接收标志
-    if (uart_rx_flag)
-    {
+    // 1. 处理UART接收：解决断包和循环覆盖问题
+    if (uart_rx_flag) {
       uart_rx_flag = 0;
+      uint32_t curr_rx_pos = RX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
       
-      // 计算接收到的数据长度
-      uint32_t current_rx_pos = RX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
+      static char line_buf[128];
+      static uint16_t line_idx = 0;
       
-      if (current_rx_pos > last_rx_pos)
-      {
-        // 计算新的数据区间长度
-        uint16_t new_data_len = current_rx_pos - last_rx_pos;
-        
-        // 创建临时缓冲区并拷贝新数据
-        uint8_t temp_buffer[RX_BUFFER_SIZE];
-        memcpy(temp_buffer, rx_buffer + last_rx_pos, new_data_len);
-        
-        // 解析新接收的命令
-        ParseUARTCommand(temp_buffer, new_data_len);
-        
-        // 更新最后接收位置
-        last_rx_pos = current_rx_pos;
-      }
-      else if (current_rx_pos < last_rx_pos)
-      {
-        // DMA缓冲区已回绕，处理回绕情况
-        uint16_t first_part_len = RX_BUFFER_SIZE - last_rx_pos;
-        uint16_t second_part_len = current_rx_pos;
-        
-        // 创建临时缓冲区并拷贝两部分数据
-        uint8_t temp_buffer[RX_BUFFER_SIZE];
-        memcpy(temp_buffer, rx_buffer + last_rx_pos, first_part_len);
-        memcpy(temp_buffer + first_part_len, rx_buffer, second_part_len);
-        
-        // 解析新接收的命令
-        ParseUARTCommand(temp_buffer, first_part_len + second_part_len);
-        
-        // 更新最后接收位置
-        last_rx_pos = current_rx_pos;
+      while (last_rx_pos != curr_rx_pos) {
+          char c = (char)rx_buffer[last_rx_pos];
+          last_rx_pos = (last_rx_pos + 1) % RX_BUFFER_SIZE;
+          
+          if (c == '\n' || c == '\r') {
+              if (line_idx > 0) {
+                  line_buf[line_idx] = '\0';
+                  ParseUARTCommand(line_buf); // 解析完整的行
+                  line_idx = 0;
+              }
+          } else if (line_idx < sizeof(line_buf) - 1) {
+              line_buf[line_idx++] = c;
+          }
       }
     }
     
-    // 检查当前运动是否即将结束，预加载下一条指令
-    CheckAndPreloadNextCommand();
+    // 2. 限位报错处理（将ISR中的耗时操作移出到主循环）
+    if (g_plotter_job.limit_triggered) {
+        g_plotter_job.limit_triggered = 0;
+        Send_UART_Msg("Error: Limit Switch Triggered!\n");
+        CommandQueue_Init(); // 清空队列，防止电机继续撞击
+
+        // 【修复】重新同步底层的实际物理位置，防止下一次绘图坐标错乱
+        Plotter_GetCurrentPosition(&executed_x, &executed_y, &executed_z);
+        last_queued_x = executed_x;
+        last_queued_y = executed_y;
+        last_queued_z = executed_z;
+    }
     
-    // 检查运动任务是否完成
-    if (g_plotter_job.is_busy == 0 && z_axis_state.is_busy == 0)
-    {
-      static uint8_t last_busy_state = 1;
-      if (last_busy_state == 1)
-      {
-        // 仅当队列为空且轴完全停止后，才发送OK\n
-        if (CommandQueue_IsEmpty())
-        {
-          static uint8_t ok_msg[] = "OK\n";
-          HAL_UART_Transmit_DMA(&huart1, ok_msg, sizeof(ok_msg)-1);
-        }
-        last_busy_state = 0;
-        
-        // 如果有预加载的指令，现在执行它
-        if (pending_command_valid)
-        {
-          // 从队列中移除已预加载的指令（因为我们已经Peek过了）
-          Command_t dummy;
-          CommandQueue_Dequeue(&dummy); // 丢弃队首，即预加载的指令
-          
-          // 执行预加载的指令（使用相对位移）
-          if (pending_command.has_xy)
-          {
-            // 计算相对位移
-            float delta_x_mm = pending_command.target_x_mm - cur_x_mm;
-            float delta_y_mm = pending_command.target_y_mm - cur_y_mm;
-            
-            int32_t pulse_x = (int32_t)(delta_x_mm * STEPS_PER_MM_X);
-            int32_t pulse_y = (int32_t)(delta_y_mm * STEPS_PER_MM_Y);
-            Plotter_StartLine(pulse_x, pulse_y, (uint16_t)pending_command.speed_hz);
-            
-            // 更新当前坐标
-            cur_x_mm = pending_command.target_x_mm;
-            cur_y_mm = pending_command.target_y_mm;
-          }
-          
-          if (pending_command.has_z)
-          {
-            // 计算相对位移
-            float delta_z_mm = pending_command.target_z_mm - cur_z_mm;
-            int32_t pulse_z = (int32_t)(delta_z_mm * STEPS_PER_MM_Z);
-            Plotter_SetZ(pulse_z, (uint16_t)pending_command.speed_hz);
-            
-            // 更新当前坐标
-            cur_z_mm = pending_command.target_z_mm;
-          }
-          
-          pending_command_valid = 0;
-        }
-        else
-        {
-          // 没有预加载的指令，尝试执行队列中的下一条指令
-          ExecuteNextCommand();
-        }
-      }
-    }
-    else
-    {
-      last_busy_state = 1;
-    }
+    // 3. 自动执行下一条指令
+    ExecuteNextCommand();
   }
   /* USER CODE END 3 */
 }

@@ -4,110 +4,71 @@
 #include "main.h"
 #include <stdint.h>
 
-// 定义单个引脚的结构
+// 统一将硬件参数定义在这里，防止 main 和 stepper_motor 出现双重定义
+#define STEPS_PER_MM_X  200.0f  
+#define STEPS_PER_MM_Y  200.0f
+#define STEPS_PER_MM_Z  400.0f
+
 typedef struct {
-    GPIO_TypeDef* port;  // GPIO 端口 (如 GPIOB)
-    uint16_t      pin;   // GPIO 引脚 (如 GPIO_PIN_4)
+    GPIO_TypeDef* port;  
+    uint16_t      pin;   
 } Plotter_Pin_t;
 
-// 定义写字机硬件配置总表
 typedef struct {
-    Plotter_Pin_t x_step;
-    Plotter_Pin_t x_dir;
-    Plotter_Pin_t y_step;
-    Plotter_Pin_t y_dir;
-    Plotter_Pin_t z_step;
-    Plotter_Pin_t z_dir;
+    Plotter_Pin_t x_step; Plotter_Pin_t x_dir;
+    Plotter_Pin_t y_step; Plotter_Pin_t y_dir;
+    Plotter_Pin_t z_step; Plotter_Pin_t z_dir;
 } Plotter_Hardware_t;
 
-// 绘图任务结构体 (Bresenham算法 + S型加减速)
 typedef struct {
-    // Bresenham算法参数
-    int32_t dx, dy;           // X,Y轴差值（绝对值）
-    int32_t err;              // 误差累积项
-    int32_t current_step;     // 当前已走步数
-    int32_t total_steps;      // 总步数（取dx,dy中较大者）
-    int8_t  dir_x, dir_y;     // 方向：1为正，-1为负
+    float accel_ratio;  
+    float jerk_ratio;   
+    float phase_ratios[7]; 
+} S_Curve_Config_t;
+
+// 绘图任务结构体 (Bresenham + S型加减速)
+typedef struct {
+    int32_t dx, dy;           
+    int32_t err;              
+    int32_t current_step;     
+    int32_t total_steps;      
+    int8_t  dir_x, dir_y;     
     
-    // S型加减速参数
-    uint16_t current_arr;     // 当前ARR值（频率 = 1MHz / (ARR+1)）
-    uint16_t start_arr;       // 起始ARR值（对应最低频率）
-    uint16_t peak_arr;        // 峰值ARR值（对应最高频率）
-    int32_t accel_steps;      // 加速段步数（T型加减速）
-    int32_t arr_step;         // 每步ARR变化量（加速斜率）
+    uint16_t current_arr;     
+    uint16_t start_arr;       
+    uint16_t peak_arr;        
+    uint32_t accel_steps;     
     
-    // 优化后的S型参数（使用定点数）
-    int32_t jerk_q16;         // 加加速度 (Q16定点数)
-    uint8_t accel_phase;      // 当前加速阶段 (0-6)
-    uint16_t phase_steps[7];  // 各阶段步数 [加加速, 匀加速, 减加速, 匀速, 加减速, 匀减速, 减减速]
-    uint16_t current_phase_step; // 当前阶段内步数
-    uint16_t phase_boundaries[7]; // 阶段边界累积步数（预计算）
+    int32_t jerk_q16;         
+    uint32_t phase_steps[7];
+    uint32_t phase_boundaries[7];
+    uint8_t accel_phase;
+    uint32_t current_phase_step;
     
-    // 状态标志
-    volatile uint8_t is_busy; // 任务忙标志
+    volatile uint8_t is_busy; 
+    volatile uint8_t limit_triggered; // 限位触发报错标志
+    
+    // 实时物理绝对步数跟踪
+    volatile int32_t abs_step_x;
+    volatile int32_t abs_step_y;
 } Plotter_Job_t;
-
-// 旧版步进电机结构体（保持兼容性）
-typedef struct {
-    // --- 硬件绑定层 ---
-    TIM_HandleTypeDef *htim;
-    uint32_t           channel;
-    GPIO_TypeDef      *dir_port;
-    uint16_t           dir_pin;
-
-    // --- 软件状态层 ---
-    uint8_t  isRunning;          // 0:停止，1:运行
-    uint8_t  current_dir;        // 当前物理运行方向 (1正, 0反)
-    uint8_t  state;              // 状态机：1-正常加减速, 2-准备换向中
-    uint8_t  pending_dir;        // 换向后的新方向
-    uint16_t pending_target_arr; // 换向后的最终目标速度
-    
-    uint16_t current_arr;        // 当前速度对应的 ARR
-    uint16_t target_arr;         // 当前阶段目标 ARR
-    uint16_t step_change;        // 每次(2ms)改变的 ARR 步长
-    uint32_t last_tick;          // 任务时间戳
-} StepperMotor_t;
-
-// 全局变量声明
-extern Plotter_Job_t g_plotter_job;
 
 // Z轴运动状态结构体
 typedef struct {
-    volatile uint8_t is_busy;      // Z轴运动忙标志
-    int32_t target_steps;          // 目标步数（绝对值）
-    int32_t current_step;          // 当前已走步数
-    uint8_t direction;             // 方向：1=正方向，0=负方向
+    volatile uint8_t is_busy;      
+    int32_t target_steps;          
+    int32_t current_step;          
+    uint8_t direction;             
+    volatile int32_t abs_step_z;   // Z轴绝对步数
 } Z_Axis_State_t;
 
+extern Plotter_Job_t g_plotter_job;
 extern Z_Axis_State_t z_axis_state;
 
-// S型曲线配置结构体
-typedef struct {
-    float accel_ratio;        // 加速段占总步数比例 (默认0.33)
-    float jerk_ratio;         // 加加速度系数 (默认1.0)
-    float phase_ratios[7];    // 各阶段比例 [加加速, 匀加速, 减加速, 匀速, 加减速, 匀减速, 减减速]
-} S_Curve_Config_t;
-
-// 新版写字机接口函数
 void Plotter_Init(Plotter_Hardware_t *hw_config);
 void Plotter_StartLine(int32_t target_x, int32_t target_y, uint16_t speed_hz);
 void Plotter_SetZ(int32_t target_z, uint16_t speed_hz);
 void Plotter_Stop(void);
-
-// S型曲线配置函数
-void Plotter_SetScurveConfig(S_Curve_Config_t *config);
-void Plotter_GetDefaultScurveConfig(S_Curve_Config_t *config);
-
-// 旧版兼容函数（可选保留）
-void Stepper_Init(StepperMotor_t *motor, TIM_HandleTypeDef *htim, uint32_t ch, GPIO_TypeDef *port, uint16_t pin);
-void Stepper_Start_Soft_Freq(StepperMotor_t *motor, uint8_t dir, float start_freq, float target_freq, uint32_t accel_time_ms);
-void Stepper_Stop(StepperMotor_t *motor);
-void Stepper_Stop_Soft(StepperMotor_t *motor, uint32_t decel_time_ms);
-void Stepper_Run_Task(StepperMotor_t *motor);
-void Stepper_Reverse_Soft(StepperMotor_t *motor, uint32_t reverse_decel_time_ms);
-void Draw_Line_Angle(StepperMotor_t *motor_x, StepperMotor_t *motor_y, float angle_deg, float total_speed_hz, uint32_t accel_time_ms);
-
-// 获取当前位置（毫米）
 void Plotter_GetCurrentPosition(float *x_mm, float *y_mm, float *z_mm);
 
 #endif /* __STEPPER_MOTOR_H */
