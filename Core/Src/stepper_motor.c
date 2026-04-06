@@ -7,8 +7,14 @@
 Plotter_Job_t g_plotter_job = {0};
 static Plotter_Hardware_t hw_config;
 
-// Z轴运动状态（已在 stepper_motor.h 中定义）
+// S型曲线默认配置
+static S_Curve_Config_t s_curve_config = {
+    .accel_ratio = 0.33f,  // 加速段占总步数33%
+    .jerk_ratio = 1.0f,    // 加加速度系数
+    .phase_ratios = {0.2f, 0.3f, 0.5f, 0.0f, 0.5f, 0.3f, 0.2f} // 各阶段比例
+};
 
+// Z轴运动状态（已在 stepper_motor.h 中定义）
 Z_Axis_State_t z_axis_state = {0};
 
 #ifndef PI
@@ -96,7 +102,7 @@ void Plotter_StartLine(int32_t tx, int32_t ty, uint16_t speed_hz) {
     else
         hw_config.y_dir.port->BSRR = (uint32_t)hw_config.y_dir.pin << 16; // 设置Y轴反方向（低电平）
 
-    // 5. T型加速初始化（纯整数运算，避免浮点开销）
+    // 5. S型加减速初始化
     // 频率范围：400Hz（低速）~ 12kHz（高速）
     // ARR计算公式：ARR = (1MHz基础频率 / 目标频率) - 1
     g_plotter_job.start_arr = 2500 - 1;      // 起始频率400Hz：1MHz/400 = 2500
@@ -106,17 +112,46 @@ void Plotter_StartLine(int32_t tx, int32_t ty, uint16_t speed_hz) {
     if (g_plotter_job.peak_arr < 83) g_plotter_job.peak_arr = 83;   // 上限12kHz：1MHz/12000 ≈ 83
     if (g_plotter_job.peak_arr > 2499) g_plotter_job.peak_arr = 2499; // 下限400Hz
     
-    // 6. 计算加速段参数（T型加速曲线）
-    if (g_plotter_job.accel_steps > 0) {
-        g_plotter_job.arr_step = (g_plotter_job.start_arr - g_plotter_job.peak_arr) / g_plotter_job.accel_steps;
+    // 6. 计算S型曲线参数（7段曲线）
+    // 使用配置参数计算总加速段步数
+    uint32_t total_accel_steps = (uint32_t)(g_plotter_job.total_steps * s_curve_config.accel_ratio);
+    if (total_accel_steps < 10) total_accel_steps = g_plotter_job.total_steps / 2; // 短距离时增加加速段比例
+    
+    // 分配各阶段步数（使用配置的比例）
+    // 阶段0: 加加速段
+    // 阶段1: 匀加速段
+    // 阶段2: 减加速段
+    // 阶段3: 匀速段
+    // 阶段4: 加减速段
+    // 阶段5: 匀减速段
+    // 阶段6: 减减速段
+    g_plotter_job.phase_steps[0] = total_accel_steps * s_curve_config.phase_ratios[0];
+    g_plotter_job.phase_steps[1] = total_accel_steps * s_curve_config.phase_ratios[1];
+    g_plotter_job.phase_steps[2] = total_accel_steps * s_curve_config.phase_ratios[2];
+    g_plotter_job.phase_steps[3] = g_plotter_job.total_steps - 2 * total_accel_steps; // 匀速段
+    g_plotter_job.phase_steps[4] = total_accel_steps * s_curve_config.phase_ratios[4];
+    g_plotter_job.phase_steps[5] = total_accel_steps * s_curve_config.phase_ratios[5];
+    g_plotter_job.phase_steps[6] = total_accel_steps * s_curve_config.phase_ratios[6];
+    
+    // 计算加加速度（jerk）参数，应用jerk_ratio系数，转换为Q16定点数
+    // jerk_q16 = (start_arr - peak_arr) * 65536 / (total_accel_steps * total_accel_steps) * jerk_ratio
+    if (total_accel_steps > 0) {
+        int32_t arr_diff = (int32_t)(g_plotter_job.start_arr - g_plotter_job.peak_arr);
+        int32_t denominator = total_accel_steps * total_accel_steps;
+        g_plotter_job.jerk_q16 = (arr_diff * 65536 / denominator) * s_curve_config.jerk_ratio;
     } else {
-        g_plotter_job.arr_step = 0;
+        g_plotter_job.jerk_q16 = 0;
     }
     
-    // 确保有加速过程（即使步数很少）
-    if (g_plotter_job.arr_step == 0 && g_plotter_job.start_arr != g_plotter_job.peak_arr) {
-        g_plotter_job.arr_step = 1;
+    // 预计算阶段边界累积步数
+    g_plotter_job.phase_boundaries[0] = g_plotter_job.phase_steps[0];
+    for (int i = 1; i < 7; i++) {
+        g_plotter_job.phase_boundaries[i] = g_plotter_job.phase_boundaries[i-1] + g_plotter_job.phase_steps[i];
     }
+    
+    // 初始化阶段参数
+    g_plotter_job.accel_phase = 0;
+    g_plotter_job.current_phase_step = 0;
 
     // 7. 初始化运动状态参数
     g_plotter_job.current_arr = g_plotter_job.start_arr;  // 当前ARR从起始值开始
@@ -257,25 +292,107 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         // 5. 更新步数计数器
         g_plotter_job.current_step++;
         
-        // 6. T型加减速控制
-        if (g_plotter_job.current_step < g_plotter_job.accel_steps) {
-            // 加速段：减小ARR（增加频率）
-            if (g_plotter_job.current_arr > g_plotter_job.peak_arr) {
-                g_plotter_job.current_arr -= g_plotter_job.arr_step;
-                if (g_plotter_job.current_arr < g_plotter_job.peak_arr) {
-                    g_plotter_job.current_arr = g_plotter_job.peak_arr;
-                }
-            }
-        } else if (g_plotter_job.current_step > (g_plotter_job.total_steps - g_plotter_job.accel_steps)) {
-            // 减速段：增加ARR（减小频率）
-            if (g_plotter_job.current_arr < g_plotter_job.start_arr) {
-                g_plotter_job.current_arr += g_plotter_job.arr_step;
-                if (g_plotter_job.current_arr > g_plotter_job.start_arr) {
-                    g_plotter_job.current_arr = g_plotter_job.start_arr;
-                }
+        // 6. S型加减速控制（7段曲线）- 优化版本
+        // 使用预计算的阶段边界快速确定当前阶段
+        uint8_t current_phase = g_plotter_job.accel_phase;
+        
+        // 如果当前步数超过当前阶段边界，更新到下一个阶段
+        if (g_plotter_job.current_step >= g_plotter_job.phase_boundaries[current_phase]) {
+            if (current_phase < 6) {
+                current_phase++;
+                g_plotter_job.accel_phase = current_phase;
+                g_plotter_job.current_phase_step = 0;
             }
         }
-        // 匀速段：保持peak_arr不变
+        
+        // 根据当前阶段计算ARR变化（使用定点数运算）
+        switch (current_phase) {
+            case 0: // 加加速段
+                // arr = start_arr - (jerk_q16 * t²) >> 16
+                {
+                    uint32_t t_sq = g_plotter_job.current_phase_step * g_plotter_job.current_phase_step;
+                    int32_t adjustment = (g_plotter_job.jerk_q16 * t_sq) >> 16;
+                    g_plotter_job.current_arr = g_plotter_job.start_arr - (uint16_t)adjustment;
+                }
+                g_plotter_job.current_phase_step++;
+                break;
+                
+            case 1: // 匀加速段
+                // arr = arr - 固定步长（预计算）
+                {
+                    uint16_t step_size = (g_plotter_job.start_arr - g_plotter_job.peak_arr) /
+                                        (g_plotter_job.phase_steps[1] + g_plotter_job.phase_steps[2]);
+                    if (step_size == 0) step_size = 1;
+                    if (g_plotter_job.current_arr > g_plotter_job.peak_arr + step_size) {
+                        g_plotter_job.current_arr -= step_size;
+                    } else {
+                        g_plotter_job.current_arr = g_plotter_job.peak_arr;
+                    }
+                }
+                g_plotter_job.current_phase_step++;
+                break;
+                
+            case 2: // 减加速段
+                // arr = peak_arr + (jerk_q16 * (剩余步数)²) >> 16
+                {
+                    uint16_t remaining_steps = g_plotter_job.phase_steps[2] - g_plotter_job.current_phase_step;
+                    uint32_t t_sq = remaining_steps * remaining_steps;
+                    int32_t adjustment = (g_plotter_job.jerk_q16 * t_sq) >> 16;
+                    g_plotter_job.current_arr = g_plotter_job.peak_arr + (uint16_t)adjustment;
+                }
+                g_plotter_job.current_phase_step++;
+                break;
+                
+            case 3: // 匀速段
+                // 保持峰值频率
+                g_plotter_job.current_arr = g_plotter_job.peak_arr;
+                // 不需要更新current_phase_step
+                break;
+                
+            case 4: // 加减速段
+                // arr = peak_arr + (jerk_q16 * t²) >> 16
+                {
+                    uint32_t t_sq = g_plotter_job.current_phase_step * g_plotter_job.current_phase_step;
+                    int32_t adjustment = (g_plotter_job.jerk_q16 * t_sq) >> 16;
+                    g_plotter_job.current_arr = g_plotter_job.peak_arr + (uint16_t)adjustment;
+                }
+                g_plotter_job.current_phase_step++;
+                break;
+                
+            case 5: // 匀减速段
+                // arr = arr + 固定步长（预计算）
+                {
+                    uint16_t step_size = (g_plotter_job.start_arr - g_plotter_job.peak_arr) /
+                                        (g_plotter_job.phase_steps[5] + g_plotter_job.phase_steps[6]);
+                    if (step_size == 0) step_size = 1;
+                    if (g_plotter_job.current_arr < g_plotter_job.start_arr - step_size) {
+                        g_plotter_job.current_arr += step_size;
+                    } else {
+                        g_plotter_job.current_arr = g_plotter_job.start_arr;
+                    }
+                }
+                g_plotter_job.current_phase_step++;
+                break;
+                
+            case 6: // 减减速段
+                // arr = start_arr - (jerk_q16 * (剩余步数)²) >> 16
+                {
+                    uint16_t remaining_steps = g_plotter_job.phase_steps[6] - g_plotter_job.current_phase_step;
+                    uint32_t t_sq = remaining_steps * remaining_steps;
+                    int32_t adjustment = (g_plotter_job.jerk_q16 * t_sq) >> 16;
+                    g_plotter_job.current_arr = g_plotter_job.start_arr - (uint16_t)adjustment;
+                }
+                g_plotter_job.current_phase_step++;
+                break;
+        }
+        
+        // 限制ARR范围，确保频率在有效范围内
+        if (g_plotter_job.current_arr < g_plotter_job.peak_arr) {
+            g_plotter_job.current_arr = g_plotter_job.peak_arr;
+        }
+        if (g_plotter_job.current_arr > g_plotter_job.start_arr) {
+            g_plotter_job.current_arr = g_plotter_job.start_arr;
+        }
         
         // 7. 更新TIM6的ARR值
         __HAL_TIM_SET_AUTORELOAD(&htim6, g_plotter_job.current_arr);
@@ -503,4 +620,49 @@ void Draw_Line_Angle(StepperMotor_t *motor_x, StepperMotor_t *motor_y, float ang
     } else {
         Stepper_Start_Soft_Freq(motor_y, dir_y, 0, abs_speed_y, accel_time_ms);
     }
+}
+
+/**
+ * @brief 设置S型曲线配置参数
+ * @param config 配置结构体指针
+ */
+void Plotter_SetScurveConfig(S_Curve_Config_t *config) {
+    if (config == NULL) return;
+    
+    // 复制配置参数
+    s_curve_config.accel_ratio = config->accel_ratio;
+    s_curve_config.jerk_ratio = config->jerk_ratio;
+    
+    // 复制各阶段比例
+    for (int i = 0; i < 7; i++) {
+        s_curve_config.phase_ratios[i] = config->phase_ratios[i];
+    }
+    
+    // 验证参数有效性
+    if (s_curve_config.accel_ratio < 0.1f) s_curve_config.accel_ratio = 0.1f;
+    if (s_curve_config.accel_ratio > 0.5f) s_curve_config.accel_ratio = 0.5f;
+    
+    if (s_curve_config.jerk_ratio < 0.1f) s_curve_config.jerk_ratio = 0.1f;
+    if (s_curve_config.jerk_ratio > 5.0f) s_curve_config.jerk_ratio = 5.0f;
+}
+
+/**
+ * @brief 获取默认S型曲线配置
+ * @param config 配置结构体指针，用于接收默认配置
+ */
+void Plotter_GetDefaultScurveConfig(S_Curve_Config_t *config) {
+    if (config == NULL) return;
+    
+    // 设置默认配置
+    config->accel_ratio = 0.33f;
+    config->jerk_ratio = 1.0f;
+    
+    // 设置各阶段默认比例
+    config->phase_ratios[0] = 0.2f;  // 加加速段
+    config->phase_ratios[1] = 0.3f;  // 匀加速段
+    config->phase_ratios[2] = 0.5f;  // 减加速段
+    config->phase_ratios[3] = 0.0f;  // 匀速段（自动计算）
+    config->phase_ratios[4] = 0.5f;  // 加减速段
+    config->phase_ratios[5] = 0.3f;  // 匀减速段
+    config->phase_ratios[6] = 0.2f;  // 减减速段
 }

@@ -42,6 +42,14 @@
 
 如果需要添加源文件或包含路径，只允许修改根目录下的 CMakeLists.txt。确保添加 User 目录到 include_directories 和 add_executable 的源文件列表中。
 
+底层驱动与API调用限制 (Low-Level Driver & API Constraints)
+
+默认知识域：基于你已掌握的 STM32F4 架构与 HAL 库通用规范进行代码推演，禁止主动调用任何 API 去读取、检索或解析 Drivers/STM32F4xx_HAL_Driver/、Drivers/CMSIS/ 等底层驱动目录下的源文件与头文件（如 stm32f4xx_hal_uart.c/h, core_cm4.h 等）。
+
+白名单操作域：使用文件搜索或读取 API 时，目标必须严格限制在业务逻辑层，即 Core/Src/ (如 main.c, stm32f4xx_it.c)、Core/Inc/ 以及自定义资产目录 User/ (如 stepper_motor.c, soft_timer.c) 内。
+
+信息缺失降级策略：若在编写代码时遇到 HAL 库具体外设配置宏（如中断标志位名称、DMA流映射）存在记忆模糊，必须采取“推测性占位符注释 + 向用户提问确认”的方式处理，严禁通过遍历底层库文件来寻找答案。
+
 ## 🚀 业务逻辑要求 (Business Logic)
 
 - 通讯协议：采用“停-等”机制。解析格式 X100 Y200 Z10\n。

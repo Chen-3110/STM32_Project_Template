@@ -20,7 +20,7 @@ typedef struct {
     Plotter_Pin_t z_dir;
 } Plotter_Hardware_t;
 
-// 绘图任务结构体 (Bresenham算法 + T型加减速)
+// 绘图任务结构体 (Bresenham算法 + S型加减速)
 typedef struct {
     // Bresenham算法参数
     int32_t dx, dy;           // X,Y轴差值（绝对值）
@@ -29,12 +29,19 @@ typedef struct {
     int32_t total_steps;      // 总步数（取dx,dy中较大者）
     int8_t  dir_x, dir_y;     // 方向：1为正，-1为负
     
-    // T型加减速参数
+    // S型加减速参数
     uint16_t current_arr;     // 当前ARR值（频率 = 1MHz / (ARR+1)）
     uint16_t start_arr;       // 起始ARR值（对应最低频率）
     uint16_t peak_arr;        // 峰值ARR值（对应最高频率）
-    uint32_t accel_steps;     // 加速段步数
-    uint16_t arr_step;        // 每步ARR变化量
+    int32_t accel_steps;      // 加速段步数（T型加减速）
+    int32_t arr_step;         // 每步ARR变化量（加速斜率）
+    
+    // 优化后的S型参数（使用定点数）
+    int32_t jerk_q16;         // 加加速度 (Q16定点数)
+    uint8_t accel_phase;      // 当前加速阶段 (0-6)
+    uint16_t phase_steps[7];  // 各阶段步数 [加加速, 匀加速, 减加速, 匀速, 加减速, 匀减速, 减减速]
+    uint16_t current_phase_step; // 当前阶段内步数
+    uint16_t phase_boundaries[7]; // 阶段边界累积步数（预计算）
     
     // 状态标志
     volatile uint8_t is_busy; // 任务忙标志
@@ -74,11 +81,22 @@ typedef struct {
 
 extern Z_Axis_State_t z_axis_state;
 
+// S型曲线配置结构体
+typedef struct {
+    float accel_ratio;        // 加速段占总步数比例 (默认0.33)
+    float jerk_ratio;         // 加加速度系数 (默认1.0)
+    float phase_ratios[7];    // 各阶段比例 [加加速, 匀加速, 减加速, 匀速, 加减速, 匀减速, 减减速]
+} S_Curve_Config_t;
+
 // 新版写字机接口函数
 void Plotter_Init(Plotter_Hardware_t *hw_config);
 void Plotter_StartLine(int32_t target_x, int32_t target_y, uint16_t speed_hz);
 void Plotter_SetZ(int32_t target_z, uint16_t speed_hz);
 void Plotter_Stop(void);
+
+// S型曲线配置函数
+void Plotter_SetScurveConfig(S_Curve_Config_t *config);
+void Plotter_GetDefaultScurveConfig(S_Curve_Config_t *config);
 
 // 旧版兼容函数（可选保留）
 void Stepper_Init(StepperMotor_t *motor, TIM_HandleTypeDef *htim, uint32_t ch, GPIO_TypeDef *port, uint16_t pin);

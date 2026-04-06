@@ -67,6 +67,12 @@ extern DMA_HandleTypeDef hdma_usart1_rx;
 
 // 运动完成状态跟踪
 static uint8_t last_busy_state = 1;
+
+#define STEPS_PER_MM_X  200.0f  // 根据你的实际硬件修改
+#define STEPS_PER_MM_Y  200.0f
+#define STEPS_PER_MM_Z  400.0f
+
+#define PLOTTER_DEFAULT_SPEED_HZ  5000  // 默认绘图速度 (单位: Hz, 范围 400-12000)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,44 +90,55 @@ void ParseUARTCommand(uint8_t* buffer, uint16_t len);
   */
 void ParseUARTCommand(uint8_t* buffer, uint16_t len)
 {
-    // 确保以换行符结尾且有足够空间添加终止符
     if (len == 0 || buffer[len-1] != '\n' || len >= RX_BUFFER_SIZE)
         return;
     
-    // 将缓冲区转换为字符串（替换换行符为终止符）
-    buffer[len-1] = '\0';  // 去掉换行符
+    buffer[len-1] = '\0';
     char* cmd = (char*)buffer;
     
-    int32_t x = 0, y = 0, z = 0;
+    // 改用 float 接收上位机传来的物理位移（如 X10.5）
+    float target_x_mm = 0, target_y_mm = 0, target_z_mm = 0;
+    uint8_t has_xy = 0, has_z = 0;
+    float speed_hz = PLOTTER_DEFAULT_SPEED_HZ; // 默认速度
+
     char* token = strtok(cmd, " ");
-    
     while (token != NULL)
     {
-        if (token[0] == 'X' || token[0] == 'x')
-        {
-            x = atoi(token + 1);
+        // 改用 atof 解析浮点数
+        if (token[0] == 'X' || token[0] == 'x') {
+            target_x_mm = atof(token + 1);
+            has_xy = 1;
         }
-        else if (token[0] == 'Y' || token[0] == 'y')
-        {
-            y = atoi(token + 1);
+        else if (token[0] == 'Y' || token[0] == 'y') {
+            target_y_mm = atof(token + 1);
+            has_xy = 1;
         }
-        else if (token[0] == 'Z' || token[0] == 'z')
-        {
-            z = atoi(token + 1);
+        else if (token[0] == 'Z' || token[0] == 'z') {
+            target_z_mm = atof(token + 1);
+            has_z = 1;
+        }
+        else if (token[0] == 'F' || token[0] == 'f') {
+            // 解析速度参数
+            speed_hz = atof(token + 1);
+            // 速度范围限制
+            if (speed_hz < 400) speed_hz = 400;
+            if (speed_hz > 12000) speed_hz = 12000;
         }
         token = strtok(NULL, " ");
     }
     
-    // 如果有有效的坐标，启动运动
-    if (x != 0 || y != 0)
+    // 将物理位移转换为实际脉冲数
+    if (has_xy)
     {
-        // 默认速度1000Hz
-        Plotter_StartLine(x, y, 1000);
+        int32_t pulse_x = (int32_t)(target_x_mm * STEPS_PER_MM_X);
+        int32_t pulse_y = (int32_t)(target_y_mm * STEPS_PER_MM_Y);
+        Plotter_StartLine(pulse_x, pulse_y, speed_hz); // 使用解析的速度参数
     }
     
-    if (z != 0)
+    if (has_z)
     {
-        Plotter_SetZ(z, 1000);
+        int32_t pulse_z = (int32_t)(target_z_mm * STEPS_PER_MM_Z);
+        Plotter_SetZ(pulse_z, speed_hz); // 使用解析的速度参数
     }
 }
 /* USER CODE END 0 */
